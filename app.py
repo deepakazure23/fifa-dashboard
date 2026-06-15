@@ -965,7 +965,7 @@ valid_matches = df[df["Team 1"].notna() & df["Team 2"].notna()]
 total_matches = len(valid_matches)
 completed_matches = valid_matches["Result"].notna().sum()
 remaining_matches = total_matches - completed_matches
-
+player_count = len([c for c in df.columns if "Pick" in c])
 st.markdown(f"""
 <div class="stat-row">
     <div class="stat-card" data-icon="🏟️">
