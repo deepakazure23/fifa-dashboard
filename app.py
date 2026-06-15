@@ -959,6 +959,37 @@ def flag_html(url):
 # =========================
 # ✅ LEADERBOARD
 # =========================
+
+completed_matches = int(df["Result"].notna().sum())
+total_matches = int(df.shape[0])
+remaining_matches = total_matches - completed_matches
+player_count = len([c for c in df.columns if "Pick" in c])
+
+st.markdown(f"""
+<div class="stat-row">
+    <div class="stat-card" data-icon="🏟️">
+        <div class="stat-label">Total Matches</div>
+        <div class="stat-value blue">{total_matches}</div>
+        <div class="stat-sublabel">Tournament Fixtures</div>
+    </div>
+    <div class="stat-card" data-icon="✅">
+        <div class="stat-label">Completed</div>
+        <div class="stat-value green">{completed_matches}</div>
+        <div class="stat-sublabel">Results Available</div>
+    </div>
+    <div class="stat-card" data-icon="⏳">
+        <div class="stat-label">Remaining</div>
+        <div class="stat-value orange">{remaining_matches}</div>
+        <div class="stat-sublabel">To Be Played</div>
+    </div>
+    <div class="stat-card" data-icon="👥">
+        <div class="stat-label">Players</div>
+        <div class="stat-value gold">{player_count}</div>
+        <div class="stat-sublabel">Prediction Participants</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
 pick_cols = [col for col in df.columns if "Pick" in col]
 
 records = []
