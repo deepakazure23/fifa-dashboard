@@ -16,7 +16,7 @@ def _load_img(path, mime):
     except:
         return ""
 
-_BASE        = r"C:\Users\Deepak.Powar\fifa"
+_BASE        = r"."
 FIFA_LOGO    = _load_img(_BASE + r"\FIFA_Logo_2026.webp",             "image/webp")
 CONCEPT_LOGO = _load_img(_BASE + r"\Concept Logo World Cup 2026.jpg",  "image/jpeg")
 
