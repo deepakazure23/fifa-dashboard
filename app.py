@@ -511,13 +511,14 @@ _ESPN_MAP = {
     "republic of korea":"South Korea",
     "ir iran":"Iran","iran":"Iran",
     "côte d'ivoire":"Ivory Coast","ivory coast":"Ivory Coast",
-    "cabo verde":"Cape Verde","cape verde":"Cape Verde",
     "bosnia & herzegovina":"Bosnia and Herzegovina",
     "bosnia and herzegovina":"Bosnia and Herzegovina",
     "north macedonia":"North Macedonia",
     "czechia":"Czech Republic","czech republic":"Czech Republic",
     "dr congo":"DR Congo","congo dr":"DR Congo",
     "saint kitts and nevis":"St Kitts and Nevis",
+    "cabo verde":"Cape Verde",
+    "cape verde":"Cape Verde",
 }
 
 def _norm_team(name):
@@ -545,16 +546,44 @@ def _is_draw_result(value):
     return bool(m and m.group(1) == m.group(2))
 
 
+def _status_text(*values):
+    bits = []
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            for key in ("Description", "Name", "Text", "Status", "State", "Phase"):
+                if v.get(key):
+                    bits.append(str(v.get(key)))
+            continue
+        if isinstance(v, list):
+            for item in v:
+                bits.append(str(item))
+            continue
+        bits.append(str(v))
+    return " ".join(bits).casefold()
+
+
+def _is_liveish(status_text):
+    return any(k in status_text for k in (
+        "live", "in progress", "inprogress", "1st half", "2nd half",
+        "half time", "halftime", "ht", "extra time", "penalty"
+    ))
+
+
+def _is_finishedish(status_text):
+    return any(k in status_text for k in (
+        "final", "finished", "completed", "full time", "ft", "aet", "post", "ended"
+    ))
+
+
 @st.cache_data(ttl=45)
 def fetch_api_results():
-    """Fetch finished WC2026 results from FIFA's official calendar API, then fall back."""
+    """Fetch only finished WC2026 results from official / fallback providers."""
     _out = {}
     _now = datetime.now(NZ_TZ)
     _diso = _now.strftime("%Y-%m-%d")
 
-    # FIFA official calendar API:
-    # public JSON with from/to/count/language parameters and match rows containing
-    # Home/Away team names plus HomeTeamScore/AwayTeamScore.
     _urls = [
         "https://api.fifa.com/api/v3/calendar/matches?count=500&from=2026-06-11T00:00:00Z&to=2026-07-20T23:59:59Z&language=en",
         "https://api.fifa.com/api/v3/calendar/matches?count=500&from=2026-06-11T00:00:00Z&to=2026-07-20T23:59:59Z&language=en&sort=Date",
@@ -599,12 +628,28 @@ def fetch_api_results():
         return None
 
     def _consume(payload):
-        # FIFA returns match rows in payload['Results']; iterate all rows because the
-        # date window already scopes the request to the tournament period.
         for _ev in payload.get("Results") or []:
             _h = _team_name(_ev.get("Home"))
             _a = _team_name(_ev.get("Away"))
             if not _h or not _a:
+                continue
+
+            _status = _status_text(
+                _ev.get("Status"),
+                _ev.get("MatchStatus"),
+                _ev.get("status"),
+                _ev.get("Phase"),
+                _ev.get("Progress"),
+                _ev.get("State"),
+                _ev.get("GameStatus"),
+                _ev.get("MatchState"),
+                _ev.get("CompetitionStatus"),
+                _ev.get("StatusDescription"),
+                _ev.get("Description"),
+            )
+
+            # Skip anything that is not explicitly finished.
+            if _is_liveish(_status) or not _is_finishedish(_status):
                 continue
 
             hs = _score(_ev.get("Home"), "Score", "HomeTeamScore")
@@ -633,7 +678,6 @@ def fetch_api_results():
         except:
             continue
 
-    # ESPN fallback (kept as backup)
     if not _out:
         _days = [(_now.date() + timedelta(days=d)).strftime("%Y%m%d") for d in (-1, 0, 1)]
         _espn_slugs = [
@@ -681,7 +725,6 @@ def fetch_api_results():
             if _out:
                 break
 
-    # thesportsdb free fallback
     if not _out:
         try:
             _url  = f"https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={_diso}&l=FIFA+World+Cup"
@@ -693,10 +736,8 @@ def fetch_api_results():
                     _hs_raw = _ev.get("intHomeScore")
                     _as_raw = _ev.get("intAwayScore")
                     if _st not in _fin_stati or _hs_raw is None: continue
-                    _h = _ESPN_MAP.get((_ev.get("strHomeTeam") or "").lower(),
-                                       _ev.get("strHomeTeam",""))
-                    _a = _ESPN_MAP.get((_ev.get("strAwayTeam") or "").lower(),
-                                       _ev.get("strAwayTeam",""))
+                    _h = _ESPN_MAP.get((_ev.get("strHomeTeam") or "").lower(), _ev.get("strHomeTeam", ""))
+                    _a = _ESPN_MAP.get((_ev.get("strAwayTeam") or "").lower(), _ev.get("strAwayTeam", ""))
                     try: _hs, _as = int(_hs_raw), int(_as_raw)
                     except: _hs, _as = 0, 0
                     _w = _h if _hs>_as else _a if _as>_hs else "Draw"
@@ -705,7 +746,6 @@ def fetch_api_results():
         except:
             pass
 
-    # ── scoreaxis fallback ───────────────────────────────────────────────────
     if not _out:
         try:
             _url  = f"https://www.scoreaxis.com/api/live-events?sport=1&date={_diso}&timeZone=0"
@@ -713,10 +753,8 @@ def fetch_api_results():
             if _resp.status_code == 200:
                 for _ev in (_resp.json().get("data",{}).get("events") or []):
                     if not _ev.get("statusFinished"): continue
-                    _h = _ESPN_MAP.get((_ev.get("homeTeamName") or "").lower(),
-                                       _ev.get("homeTeamName",""))
-                    _a = _ESPN_MAP.get((_ev.get("awayTeamName") or "").lower(),
-                                       _ev.get("awayTeamName",""))
+                    _h = _ESPN_MAP.get((_ev.get("homeTeamName") or "").lower(), _ev.get("homeTeamName",""))
+                    _a = _ESPN_MAP.get((_ev.get("awayTeamName") or "").lower(), _ev.get("awayTeamName",""))
                     try: _hs = int(_ev.get("homeScore",0)); _as = int(_ev.get("awayScore",0))
                     except: _hs, _as = 0, 0
                     _w = _h if _hs>_as else _a if _as>_hs else "Draw"
@@ -726,7 +764,6 @@ def fetch_api_results():
             pass
 
     return _out
-
 
 
 @st.cache_data(ttl=15)
@@ -783,34 +820,6 @@ def fetch_live_scores():
             pass
         return None
 
-    def _status_text(*values):
-        bits = []
-        for v in values:
-            if v is None:
-                continue
-            if isinstance(v, dict):
-                for key in ("Description", "Name", "Text", "Status", "State", "Phase"):
-                    if v.get(key):
-                        bits.append(str(v.get(key)))
-                continue
-            if isinstance(v, list):
-                for item in v:
-                    bits.append(str(item))
-                continue
-            bits.append(str(v))
-        return " ".join(bits).casefold()
-
-    def _is_liveish(status_text):
-        return any(k in status_text for k in (
-            "live", "in progress", "inprogress", "1st half", "2nd half",
-            "half time", "halftime", "ht", "extra time", "penalty"
-        ))
-
-    def _is_finishedish(status_text):
-        return any(k in status_text for k in (
-            "final", "finished", "completed", "full time", "ft", "aet", "post", "ended"
-        ))
-
     def _store_pair(team_a, team_b, score_a, score_b, status):
         _n0 = _norm_team(team_a)
         _n1 = _norm_team(team_b)
@@ -851,8 +860,7 @@ def fetch_live_scores():
                 if as_ is None:
                     as_ = _score(_ev, "AwayTeamScore", "AwayScore")
 
-                # Accept any clearly live event with available scores.
-                if hs is not None and as_ is not None and (_is_liveish(_status) or not _is_finishedish(_status)):
+                if hs is not None and as_ is not None and _is_liveish(_status) and not _is_finishedish(_status):
                     _store_pair(_h, _a, hs, as_, _status or "live")
 
             if _out:
@@ -919,7 +927,6 @@ def fetch_live_scores():
                         or ""
                     ).casefold()
 
-                    # Use only live-ish Scoreaxis rows that are not finished.
                     if _ev.get("statusFinished") is True:
                         continue
                     if not (_is_liveish(_status) or "live" in _status or "in progress" in _status or "half" in _status):
@@ -945,10 +952,12 @@ def fetch_live_scores():
     return _out
 
 
-def sync_results_to_excel(file_path, api_results, sheet_name="Sheet1"):
+def sync_results_to_excel(file_path, api_results, live_scores=None, sheet_name="Sheet1"):
     """
     Write API results back into the Excel Result column.
     Only fills blank Result cells so manual values stay intact.
+    Skips any match that is currently live (present in live_scores) to
+    prevent pre/in-match 0-0 scores being written as final results.
     """
     wb = load_workbook(file_path)
     ws = wb[sheet_name]
@@ -959,13 +968,16 @@ def sync_results_to_excel(file_path, api_results, sheet_name="Sheet1"):
         if ws.cell(1, c).value is not None
     }
 
-    c_team1 = headers.get("Team 1")
-    c_team2 = headers.get("Team 2")
+    c_team1  = headers.get("Team 1")
+    c_team2  = headers.get("Team 2")
     c_result = headers.get("Result")
+    c_date   = headers.get("Date (NZDT)")
+    c_time   = headers.get("Time (NZDT)")
 
     if not c_team1 or not c_team2 or not c_result:
         raise ValueError("Missing required columns: Team 1, Team 2, Result")
 
+    _now_sync = datetime.now(NZ_TZ)
     updated = 0
 
     for r in range(2, ws.max_row + 1):
@@ -982,6 +994,29 @@ def sync_results_to_excel(file_path, api_results, sheet_name="Sheet1"):
 
         k1 = _team_key(team1)
         k2 = _team_key(team2)
+
+        # Skip matches that are currently live.
+        if live_scores and (live_scores.get((k1, k2)) or live_scores.get((k2, k1))):
+            continue
+
+        # Skip matches that are within the live window (0-130 min after kick-off)
+        # to avoid writing a 0-0 placeholder as a final result.
+        try:
+            if c_date and c_time:
+                _raw_date = ws.cell(r, c_date).value
+                _raw_time = ws.cell(r, c_time).value
+                if _raw_date is not None:
+                    _match_dt = pd.to_datetime(_raw_date)
+                    _t = parse_time(_raw_time)
+                    if _t:
+                        _match_dt = datetime.combine(_match_dt.date(), _t).replace(tzinfo=NZ_TZ)
+                    else:
+                        _match_dt = _match_dt.replace(tzinfo=NZ_TZ)
+                    _secs = (_now_sync - _match_dt).total_seconds()
+                    if 0 <= _secs <= (130 * 60):
+                        continue  # still in live window
+        except Exception:
+            pass
 
         winner = api_results.get((k1, k2)) or api_results.get((k2, k1))
         if winner:
@@ -1003,7 +1038,7 @@ except:
 _api_results = fetch_api_results()
 _live_scores = fetch_live_scores()
 try:
-    _ = sync_results_to_excel(FILE_PATH, _api_results)
+    _ = sync_results_to_excel(FILE_PATH, _api_results, live_scores=_live_scores)
 except Exception as e:
     st.warning(f"Could not sync API results back to Excel: {e}")
 
@@ -1299,22 +1334,51 @@ else:
         api_result = _api_results.get((k1, k2)) or _api_results.get((k2, k1))
         has_result = result is not None and str(result).strip() != ""
         live_state = str((live or {}).get("status", "")).casefold()
-        finalized_live_draw = bool(
-            live
-            and live.get("home") is not None
-            and live.get("away") is not None
-            and live.get("home") == live.get("away")
-            and any(k in live_state for k in ("postperiod", "post", "finished", "completed", "final"))
-        )
 
-        # If a final result is already known, use it immediately.
-        # Do not let a live provider response override a completed match.
-        if not has_result and api_result:
+        # Detect live: match keyword-based phrases OR ESPN's short 'in'/'active' codes.
+        # _live_scores only ever stores in-progress matches, so if live is set it IS live.
+        is_live_feed = bool(
+            live and (
+                any(k in live_state for k in (
+                    "live", "in progress", "inprogress", "1st half", "2nd half",
+                    "half time", "halftime", "ht", "extra time", "penalty"
+                ))
+                or live_state in ("in", "active", "in_progress", "inprogress")
+                or live is not None  # fallback: trust _live_scores entirely
+            )
+        )
+        is_finished_feed = bool(live and any(k in live_state for k in (
+            "finished", "completed", "final", "post", "postperiod"
+        )))
+
+        # Time-based live-window guard (0 – 130 min after kick-off).
+        # Prevents a stale 0-0 "Draw" from the API being shown as final
+        # while the match is still in progress or only just finished.
+        _secs_since_ko = (now - dt).total_seconds() if dt else 9999
+        _in_live_window = dt is not None and 0 <= _secs_since_ko <= (130 * 60)
+
+        if is_live_feed:
+            # Live data is available – clear any stale Excel / API result.
+            has_result = False
+            result = None
+        elif _in_live_window and has_result and _is_draw_result(result):
+            # A "Draw" within the live window is likely a pre-match / in-progress
+            # 0-0 placeholder written to Excel by a previous run.  Treat as pending.
+            has_result = False
+            result = None
+        elif not has_result and api_result and not _in_live_window:
+            # Match is clearly over (> 130 min since kick-off) – trust the API result.
             result = str(api_result).strip()
             has_result = True
 
-        # Some providers expose a 0-0 / 1-1 final score before the Result column is filled.
-        # Treat those as finished draws so they do not remain stuck on WAITING FOR RESULT.
+        # If a live feed has clearly finished and it's a draw, show Draw.
+        finalized_live_draw = bool(
+            is_finished_feed
+            and live
+            and live.get("home") is not None
+            and live.get("away") is not None
+            and live.get("home") == live.get("away")
+        )
         if finalized_live_draw and not has_result:
             result = "Draw"
             has_result = True
@@ -1322,11 +1386,11 @@ else:
         f1 = flag_html(get_flag_url(team1))
         f2 = flag_html(get_flag_url(team2))
 
-        # ── Status: finished overrides live; live only when the live feed says so ──
-        if has_result or finalized_live_draw:
-            status = "Finished"
-        elif live:
+        # Status: live feed first, then finished, then scheduled/pending.
+        if is_live_feed:
             status = "LIVE"
+        elif has_result or finalized_live_draw:
+            status = "Finished"
         elif dt:
             diff = (now - dt).total_seconds()
             if diff < 0:
@@ -1396,6 +1460,7 @@ else:
 
 # =========================
 # 👥 PLAYER SUMMARY
+
 # =========================
 st.markdown('<div class="section-title">👥 Player Summary</div>', unsafe_allow_html=True)
 st.dataframe(leaderboard, use_container_width=True, hide_index=True)
