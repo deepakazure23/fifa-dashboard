@@ -16,8 +16,6 @@ import tempfile
 import base64
 import requests as req
 
-SHAREPOINT_FILE = "https://ahunga.sharepoint.com/:x:/r/sites/CloudSharedPlatforms/Shared%20Documents/General/Fun%20Stuff/FIFA%20World%20Cup%202026/World%20Cup%202026%20Comp.xlsx?d=wed124785bb454f65ba30e5d77600c610&csf=1&web=1&e=4Y1OVT"
-
 FILE_PATH = os.path.join(
     tempfile.gettempdir(),
     "World_Cup_2026_Comp.xlsx"
@@ -274,7 +272,7 @@ st.markdown("""
 .flag-blank { width: 38px; height: 26px; display: inline-block; }
 
 /* ── VS / Result divider ── */
-.vs-center { min-width: 88px; text-align: center; }
+.vs-center { min-width: 110px; text-align: center; }
 .vs-text {
     font-family: 'Bebas Neue', Impact, sans-serif;
     font-size: 20px;
@@ -288,11 +286,20 @@ st.markdown("""
     line-height: 1.35;
     letter-spacing: 1px;
 }
+.result-win.score-line {
+    font-size: 26px;
+    letter-spacing: 3px;
+    color: #80e8a8;
+    text-shadow: 0 0 18px rgba(128,232,168,0.35);
+}
 .result-draw {
     font-family: 'Bebas Neue', Impact, sans-serif;
-    font-size: 16px;
+    font-size: 26px;
     color: #90c8ff;
-    letter-spacing: 2px;
+    letter-spacing: 3px;
+    line-height: 1.2;
+    text-align: center;
+    text-shadow: 0 0 14px rgba(144,200,255,0.3);
 }
 .live-pulse {
     font-family: 'Bebas Neue', Impact, sans-serif;
@@ -519,9 +526,6 @@ st.markdown("""
 <div class="fb" style="left:89%; --fdur:28s; --fdel:-15s">⚽</div>
 """, unsafe_allow_html=True)
 
-FILE_PATH = str(BASE_DIR / "World Cup 2026 Comp.xlsx")
-
-
 NZ_TZ = ZoneInfo("Pacific/Auckland")
 
 def parse_time(val):
@@ -539,9 +543,10 @@ def build_dt(row):
     t = row["ParsedTime"] or datetime.min.time()
     return datetime.combine(base, t).replace(tzinfo=NZ_TZ)
 
-@st.cache_data
-def load_data(_mtime=0):
-    _df = pd.read_excel(FILE_PATH, sheet_name="Sheet1")
+@st.cache_data(ttl=60)
+def load_data(_mtime=0, _path=None):
+    _target = _path or FILE_PATH
+    _df = pd.read_excel(_target, sheet_name="Sheet1")
     _df["Date (NZDT)"] = pd.to_datetime(_df["Date (NZDT)"], errors="coerce")
     _df["ParsedTime"]  = _df["Time (NZDT)"].apply(parse_time)
     _df["DateTime"]    = _df.apply(build_dt, axis=1)
@@ -626,6 +631,7 @@ def _is_finishedish(status_text):
 def fetch_api_results():
     """Fetch only finished WC2026 results from official / fallback providers."""
     _out = {}
+    _scores_out = {}
     _now = datetime.now(NZ_TZ)
     _diso = _now.strftime("%Y-%m-%d")
 
@@ -711,6 +717,9 @@ def fetch_api_results():
             _w = _n0 if hs > as_ else _n1 if as_ > hs else "Draw"
             _out[(_team_key(_n0), _team_key(_n1))] = _w
             _out[(_team_key(_n1), _team_key(_n0))] = _w
+            # Store scores so match cards can display "2 - 1" etc.
+            _scores_out[(_team_key(_n0), _team_key(_n1))] = (hs, as_)
+            _scores_out[(_team_key(_n1), _team_key(_n0))] = (as_, hs)
 
     for _url in _urls:
         try:
@@ -718,97 +727,112 @@ def fetch_api_results():
             if _resp.status_code != 200:
                 continue
             _consume(_resp.json())
-            if _out:
-                break
+            break  # got a valid response from FIFA, no need to try the second URL
         except:
             continue
 
-    if not _out:
-        _days = [(_now.date() + timedelta(days=d)).strftime("%Y%m%d") for d in (-1, 0, 1)]
-        _espn_slugs = [
-            "fifa.worldcup",
-            "fifa.world",
-            "global.2026-fifa-world-cup",
-            "fifa.worldcup.2026",
-        ]
-        for _day in _days:
-            for _slug in _espn_slugs:
-                try:
-                    _url  = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{_slug}/scoreboard?dates={_day}"
-                    _resp = req.get(_url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
-                    if _resp.status_code != 200:
-                        continue
-                    _data = _resp.json()
-                    for _ev in _data.get("events", []):
-                        _comp  = (_ev.get("competitions") or [{}])[0]
-                        _status = _comp.get("status", {}).get("type", {})
-                        _done  = bool(_status.get("completed", False) or _status.get("state") == "post")
-                        if not _done:
-                            continue
-
-                        _teams = _comp.get("competitors", [])
-                        if len(_teams) < 2:
-                            continue
-
-                        _names = [t.get("team", {}).get("displayName", "") for t in _teams]
-                        _scores = []
-                        for _t in _teams:
-                            try:
-                                _scores.append(int(_t.get("score", 0) or 0))
-                            except:
-                                _scores.append(0)
-
-                        _n0 = _norm_team(_names[0])
-                        _n1 = _norm_team(_names[1])
-                        _w  = _n0 if _scores[0] > _scores[1] else _n1 if _scores[1] > _scores[0] else "Draw"
-                        _out[(_team_key(_n0), _team_key(_n1))] = _w
-                        _out[(_team_key(_n1), _team_key(_n0))] = _w
-                    if _out:
-                        break
-                except:
+    # Always run ESPN regardless — FIFA may have missed some matches.
+    _days = [(_now.date() + timedelta(days=d)).strftime("%Y%m%d") for d in (-1, 0, 1)]
+    _espn_slugs = [
+        "fifa.worldcup",
+        "fifa.world",
+        "global.2026-fifa-world-cup",
+        "fifa.worldcup.2026",
+    ]
+    for _day in _days:
+        _espn_found = False
+        for _slug in _espn_slugs:
+            try:
+                _url  = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{_slug}/scoreboard?dates={_day}"
+                _resp = req.get(_url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+                if _resp.status_code != 200:
                     continue
-            if _out:
-                break
+                _data = _resp.json()
+                _ev_list = _data.get("events", [])
+                if not _ev_list:
+                    continue
+                _espn_found = True
+                for _ev in _ev_list:
+                    _comp  = (_ev.get("competitions") or [{}])[0]
+                    _status = _comp.get("status", {}).get("type", {})
+                    _done  = bool(_status.get("completed", False) or _status.get("state") == "post")
+                    if not _done:
+                        continue
 
-    if not _out:
-        try:
-            _url  = f"https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={_diso}&l=FIFA+World+Cup"
-            _resp = req.get(_url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
-            if _resp.status_code == 200:
-                _fin_stati = {"match finished","ft","aet","pen","ap"}
-                for _ev in (_resp.json().get("events") or []):
-                    _st = (_ev.get("strStatus") or "").lower().strip()
-                    _hs_raw = _ev.get("intHomeScore")
-                    _as_raw = _ev.get("intAwayScore")
-                    if _st not in _fin_stati or _hs_raw is None: continue
-                    _h = _ESPN_MAP.get((_ev.get("strHomeTeam") or "").lower(), _ev.get("strHomeTeam", ""))
-                    _a = _ESPN_MAP.get((_ev.get("strAwayTeam") or "").lower(), _ev.get("strAwayTeam", ""))
+                    _teams = _comp.get("competitors", [])
+                    if len(_teams) < 2:
+                        continue
+
+                    _names = [t.get("team", {}).get("displayName", "") for t in _teams]
+                    _sc = []
+                    for _t in _teams:
+                        try:
+                            _sc.append(int(_t.get("score", 0) or 0))
+                        except:
+                            _sc.append(0)
+
+                    _n0 = _norm_team(_names[0])
+                    _n1 = _norm_team(_names[1])
+                    _k0, _k1 = _team_key(_n0), _team_key(_n1)
+                    # Only fill gaps — don't overwrite FIFA data
+                    if (_k0, _k1) not in _out:
+                        _w  = _n0 if _sc[0] > _sc[1] else _n1 if _sc[1] > _sc[0] else "Draw"
+                        _out[(_k0, _k1)] = _w
+                        _out[(_k1, _k0)] = _w
+                        _scores_out[(_k0, _k1)] = (_sc[0], _sc[1])
+                        _scores_out[(_k1, _k0)] = (_sc[1], _sc[0])
+                if _espn_found:
+                    break  # found events for this day on this slug
+            except:
+                continue
+
+    # TheSportsDB — fills any remaining gaps
+    try:
+        _url  = f"https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={_diso}&l=FIFA+World+Cup"
+        _resp = req.get(_url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        if _resp.status_code == 200:
+            _fin_stati = {"match finished","ft","aet","pen","ap"}
+            for _ev in (_resp.json().get("events") or []):
+                _st = (_ev.get("strStatus") or "").lower().strip()
+                _hs_raw = _ev.get("intHomeScore")
+                _as_raw = _ev.get("intAwayScore")
+                if _st not in _fin_stati or _hs_raw is None: continue
+                _h = _ESPN_MAP.get((_ev.get("strHomeTeam") or "").lower(), _ev.get("strHomeTeam", ""))
+                _a = _ESPN_MAP.get((_ev.get("strAwayTeam") or "").lower(), _ev.get("strAwayTeam", ""))
+                _k0, _k1 = _h.lower(), _a.lower()
+                if (_k0, _k1) not in _out:
                     try: _hs, _as = int(_hs_raw), int(_as_raw)
                     except: _hs, _as = 0, 0
                     _w = _h if _hs>_as else _a if _as>_hs else "Draw"
-                    _out[(_h.lower(), _a.lower())] = _w
-                    _out[(_a.lower(), _h.lower())] = _w
-        except:
-            pass
+                    _out[(_k0, _k1)] = _w
+                    _out[(_k1, _k0)] = _w
+                    _scores_out[(_k0, _k1)] = (_hs, _as)
+                    _scores_out[(_k1, _k0)] = (_as, _hs)
+    except:
+        pass
 
-    if not _out:
-        try:
-            _url  = f"https://www.scoreaxis.com/api/live-events?sport=1&date={_diso}&timeZone=0"
-            _resp = req.get(_url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
-            if _resp.status_code == 200:
-                for _ev in (_resp.json().get("data",{}).get("events") or []):
-                    if not _ev.get("statusFinished"): continue
-                    _h = _ESPN_MAP.get((_ev.get("homeTeamName") or "").lower(), _ev.get("homeTeamName",""))
-                    _a = _ESPN_MAP.get((_ev.get("awayTeamName") or "").lower(), _ev.get("awayTeamName",""))
+    # Scoreaxis — last resort for any still-missing matches
+    try:
+        _url  = f"https://www.scoreaxis.com/api/live-events?sport=1&date={_diso}&timeZone=0"
+        _resp = req.get(_url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+        if _resp.status_code == 200:
+            for _ev in (_resp.json().get("data",{}).get("events") or []):
+                if not _ev.get("statusFinished"): continue
+                _h = _ESPN_MAP.get((_ev.get("homeTeamName") or "").lower(), _ev.get("homeTeamName",""))
+                _a = _ESPN_MAP.get((_ev.get("awayTeamName") or "").lower(), _ev.get("awayTeamName",""))
+                _k0, _k1 = _h.lower(), _a.lower()
+                if (_k0, _k1) not in _out:
                     try: _hs = int(_ev.get("homeScore",0)); _as = int(_ev.get("awayScore",0))
                     except: _hs, _as = 0, 0
                     _w = _h if _hs>_as else _a if _as>_hs else "Draw"
-                    _out[(_h.lower(), _a.lower())] = _w
-                    _out[(_a.lower(), _h.lower())] = _w
-        except:
-            pass
+                    _out[(_k0, _k1)] = _w
+                    _out[(_k1, _k0)] = _w
+                    _scores_out[(_k0, _k1)] = (_hs, _as)
+                    _scores_out[(_k1, _k0)] = (_as, _hs)
+    except:
+        pass
 
-    return _out
+    return _out, _scores_out
 
 
 @st.cache_data(ttl=15)
@@ -1074,13 +1098,47 @@ def sync_results_to_excel(file_path, api_results, live_scores=None, sheet_name="
     return updated
 
 
+# ── Resolve which Excel file to use ─────────────────────────────────────────
+# Priority: 1) temp-dir copy downloaded from SharePoint
+#           2) local copy committed alongside app.py in the repo
+LOCAL_FILE_PATH = str(BASE_DIR / "World Cup 2026 Comp.xlsx")
+
+def _resolve_file_path():
+    """Return the path to the Excel file, downloading from SharePoint if needed."""
+    # Already have a fresh temp copy — use it
+    if os.path.exists(FILE_PATH):
+        return FILE_PATH
+
+    # Try to download from SharePoint
+    token = os.getenv("GRAPH_ACCESS_TOKEN")
+    if token:
+        try:
+            download_workbook()
+            if os.path.exists(FILE_PATH):
+                return FILE_PATH
+        except Exception as _dl_err:
+            st.warning(f"⚠️ SharePoint download failed: {_dl_err}. Falling back to local file.")
+
+    # Fall back to the repo copy
+    if os.path.exists(LOCAL_FILE_PATH):
+        return LOCAL_FILE_PATH
+
+    st.error(
+        "❌ Could not find the Excel workbook. "
+        "Make sure `World Cup 2026 Comp.xlsx` is committed to your repo "
+        "or that `GRAPH_ACCESS_TOKEN` is set in Streamlit secrets."
+    )
+    st.stop()
+
+FILE_PATH = _resolve_file_path()
+
 # mtime cache key → re-reads Excel only when file is saved
 try:
     _mtime = os.path.getmtime(FILE_PATH)
-except:
+except Exception:
     _mtime = 0
 
-_api_results = fetch_api_results()
+_api_results, _api_scores = fetch_api_results()
 _live_scores = fetch_live_scores()
 try:
     _ = sync_results_to_excel(FILE_PATH, _api_results, live_scores=_live_scores)
@@ -1089,10 +1147,10 @@ except Exception as e:
 
 try:
     _mtime = os.path.getmtime(FILE_PATH)
-except:
+except Exception:
     _mtime = 0
 
-df = load_data(_mtime)
+df = load_data(_mtime, _path=FILE_PATH)
 
 # Create an in-memory copy of the spreadsheet and fill missing Result cells
 # from API results so the UI updates immediately without requiring Excel writes.
@@ -1115,31 +1173,48 @@ try:
 except Exception:
     pass
 
-# ── Smart refresh: only reload while finished matches are still awaiting an API result ───────
+
+# ── Smart refresh: keep polling while any today's match is live or recently finished ──────────
 _now = datetime.now(NZ_TZ)
 _today_matches = df[df["Date (NZDT)"].dt.date == _now.date()]
 _has_pending = False
+_pending_minutes = []
+
 for _, _tm in _today_matches.iterrows():
     _r_val = str(_tm["Result"]).strip() if pd.notna(_tm["Result"]) else None
     _dt = _tm.get("DateTime")
-    # Only trigger polling for matches that should already have finished
-    if not _r_val and _dt and _dt <= _now:
+    if _dt is None:
+        continue
+    _secs = (_now - _dt).total_seconds()
+    _mins = _secs / 60.0
+
+    # A match is "active" if it kicked off and hasn't been clearly finished
+    # for more than 30 minutes (covers 90-min + 30-min buffer = 120 min).
+    # We keep refreshing during this whole window regardless of whether the
+    # API already has a result, so cache expiry is caught quickly.
+    _in_window = 0 <= _secs <= (120 * 60)
+
+    if _dt <= _now and _in_window:
+        _has_pending = True
+        _pending_minutes.append(_mins)
+    elif not _r_val and _dt <= _now:
+        # Past the window but still no result — keep polling slowly
         _t1 = str(_tm["Team 1"]).strip() if pd.notna(_tm["Team 1"]) else ""
         _t2 = str(_tm["Team 2"]).strip() if pd.notna(_tm["Team 2"]) else ""
         if not (_api_results.get((_team_key(_t1), _team_key(_t2))) or _api_results.get((_team_key(_t2), _team_key(_t1)))):
             _has_pending = True
-            break
+            _pending_minutes.append(_mins)
 
 if _has_pending:
-    # Recheck soon after a match finishes, then back off to 30 minutes while pending.
-    _pending_minutes = []
-    for _, _tm in _today_matches.iterrows():
-        _r_val = str(_tm["Result"]).strip() if pd.notna(_tm["Result"]) else None
-        _dt = _tm.get("DateTime")
-        if not _r_val and _dt and _dt <= _now:
-            _pending_minutes.append((_now - _dt).total_seconds() / 60.0)
+    # During / just after a match: refresh every 45 s (matches fetch_api_results ttl).
+    # Waiting > 30 min with no result: back off to every 3 minutes.
+    if _pending_minutes and min(_pending_minutes) < 30:
+        _delay_ms = 45_000    # 45 seconds — aligned with API cache TTL
+    elif _pending_minutes and min(_pending_minutes) < 150:
+        _delay_ms = 90_000    # 90 seconds for recently-finished matches
+    else:
+        _delay_ms = 180_000   # 3 minutes — slow poll for stale pending
 
-    _delay_ms = 60000 if _pending_minutes and min(_pending_minutes) < 30 else 1800000
     components.html(
         f"<script>setTimeout(()=>window.parent.location.reload(true),{_delay_ms});</script>",
         height=0
@@ -1377,24 +1452,26 @@ else:
 
         live = (_live_scores.get((k1, k2)) or _live_scores.get((k2, k1))) if '_live_scores' in globals() else None
         api_result = _api_results.get((k1, k2)) or _api_results.get((k2, k1))
+        api_score  = (_api_scores.get((k1, k2)) or _api_scores.get((k2, k1))) if '_api_scores' in globals() else None
         has_result = result is not None and str(result).strip() != ""
         live_state = str((live or {}).get("status", "")).casefold()
 
-        # Detect live: match keyword-based phrases OR ESPN's short 'in'/'active' codes.
-        # _live_scores only ever stores in-progress matches, so if live is set it IS live.
+        # ── Classify feed status ──────────────────────────────────────────────
+        # is_finished_feed must be evaluated first — used inside is_live_feed.
+        is_finished_feed = bool(live and any(k in live_state for k in (
+            "finished", "completed", "final", "post", "postperiod", "ft", "aet"
+        )))
+
+        # Only treat as live if the feed is NOT already finished.
         is_live_feed = bool(
-            live and (
+            live and not is_finished_feed and (
                 any(k in live_state for k in (
                     "live", "in progress", "inprogress", "1st half", "2nd half",
                     "half time", "halftime", "ht", "extra time", "penalty"
                 ))
                 or live_state in ("in", "active", "in_progress", "inprogress")
-                or live is not None  # fallback: trust _live_scores entirely
             )
         )
-        is_finished_feed = bool(live and any(k in live_state for k in (
-            "finished", "completed", "final", "post", "postperiod"
-        )))
 
         # Time-based live-window guard (0 – 130 min after kick-off).
         # Prevents a stale 0-0 "Draw" from the API being shown as final
@@ -1409,10 +1486,14 @@ else:
         elif _in_live_window and has_result and _is_draw_result(result):
             # A "Draw" within the live window is likely a pre-match / in-progress
             # 0-0 placeholder written to Excel by a previous run.  Treat as pending.
-            has_result = False
-            result = None
-        elif not has_result and api_result and not _in_live_window:
-            # Match is clearly over (> 130 min since kick-off) – trust the API result.
+            # BUT if the API explicitly confirms it as finished, trust the API.
+            api_confirmed = bool(api_result)
+            if not api_confirmed:
+                has_result = False
+                result = None
+        elif not has_result and api_result:
+            # API has a result — trust it regardless of the live window.
+            # The live-window guard was blocking the last match of the day.
             result = str(api_result).strip()
             has_result = True
 
@@ -1448,14 +1529,42 @@ else:
         # ── Centre display ───────────────────────────────────────────────────
         t1_cls = t2_cls = ""
         if status == "Finished":
+            # Try to get the score from API score dict or live feed
+            _fin_score = api_score or (
+                (live.get("home"), live.get("away")) if live else None
+            )
             if result and _is_draw_result(result):
-                score_html = '<span class="result-draw">⚖ DRAW</span>'
+                if _fin_score and _fin_score[0] is not None:
+                    score_html = (
+                        f'<span class="result-draw">'
+                        f'{_fin_score[0]} — {_fin_score[1]}'
+                        f'<br><small style="font-size:11px;letter-spacing:2px;opacity:0.8;">DRAW</small>'
+                        f'</span>'
+                    )
+                else:
+                    score_html = '<span class="result-draw">⚖ DRAW</span>'
             elif result and _team_key(result) == _team_key(team1):
                 t1_cls, t2_cls = "winner", "loser"
-                score_html = f'<span class="result-win">✓ {team1}<br>WINS</span>'
+                if _fin_score and _fin_score[0] is not None:
+                    score_html = (
+                        f'<span class="result-win score-line">'
+                        f'{_fin_score[0]} — {_fin_score[1]}'
+                        f'<br><span style="font-size:13px;letter-spacing:2px;color:#ffd700;font-family:\'Bebas Neue\',Impact,sans-serif;">✓ {team1} WINS</span>'
+                        f'</span>'
+                    )
+                else:
+                    score_html = f'<span class="result-win">✓ {team1}<br>WINS</span>'
             elif result and _team_key(result) == _team_key(team2):
                 t1_cls, t2_cls = "loser", "winner"
-                score_html = f'<span class="result-win">✓ {team2}<br>WINS</span>'
+                if _fin_score and _fin_score[0] is not None:
+                    score_html = (
+                        f'<span class="result-win score-line">'
+                        f'{_fin_score[0]} — {_fin_score[1]}'
+                        f'<br><span style="font-size:13px;letter-spacing:2px;color:#ffd700;font-family:\'Bebas Neue\',Impact,sans-serif;">✓ {team2} WINS</span>'
+                        f'</span>'
+                    )
+                else:
+                    score_html = f'<span class="result-win">✓ {team2}<br>WINS</span>'
             else:
                 score_html = f'<span class="result-win">{result}</span>'
         elif status == "LIVE":
