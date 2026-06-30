@@ -596,6 +596,25 @@ def _is_draw_result(value):
     return bool(m and m.group(1) == m.group(2))
 
 
+def _parse_pens(value):
+    """Parse a penalty-shootout score like '4-3', '4:3', '4 - 3' into (int, int)."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    s = str(value).replace("—", "-").replace("–", "-").replace(":", "-").strip()
+    m = re.search(r'(\d+)\s*[-]\s*(\d+)', s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except Exception:
+        return None
+
+
 def _status_text(*values):
     bits = []
     for v in values:
@@ -627,12 +646,59 @@ def _is_finishedish(status_text):
     ))
 
 
+def _extract_pens_fifa(ev):
+    """Best-effort extraction of a penalty-shootout score from a FIFA calendar event."""
+    for hk, ak in [
+        ("HomePenaltyScore", "AwayPenaltyScore"),
+        ("PenaltyHomeScore", "PenaltyAwayScore"),
+        ("HomePenalties", "AwayPenalties"),
+        ("HomePenaltyGoals", "AwayPenaltyGoals"),
+    ]:
+        hv, av = ev.get(hk), ev.get(ak)
+        if hv is not None and av is not None:
+            try:
+                return int(hv), int(av)
+            except Exception:
+                pass
+    home_b, away_b = ev.get("Home"), ev.get("Away")
+    if isinstance(home_b, dict) and isinstance(away_b, dict):
+        for blk_key in ("PenaltyScore", "ShootoutScore", "Pens", "PenaltyGoals"):
+            hv, av = home_b.get(blk_key), away_b.get(blk_key)
+            if hv is not None and av is not None:
+                try:
+                    return int(hv), int(av)
+                except Exception:
+                    pass
+    return None
+
+
+def _extract_pens_espn(competitors):
+    """Best-effort extraction of a penalty-shootout score from ESPN competitor blocks."""
+    if not competitors or len(competitors) < 2:
+        return None
+    try:
+        vals = []
+        for c in competitors:
+            v = c.get("shootoutScore")
+            if v is None:
+                v = c.get("shootout_score")
+            if v is None:
+                return None
+            vals.append(int(v))
+        if len(vals) == 2:
+            return vals[0], vals[1]
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=120)
 def fetch_api_results():
     """Fetch only finished WC2026 results from official / fallback providers."""
     _out = {}
     _scores_out = {}
     _datetimes_out = {}  # team pair → kick-off datetime in NZT
+    _pens_out = {}        # team pair → (home_pens, away_pens) from a penalty shootout
     _now = datetime.now(NZ_TZ)
     _diso = _now.strftime("%Y-%m-%d")
 
@@ -715,7 +781,20 @@ def fetch_api_results():
 
             _n0 = _norm_team(_h)
             _n1 = _norm_team(_a)
-            _w = _n0 if hs > as_ else _n1 if as_ > hs else "Draw"
+
+            # If level after full/extra time, a knockout match is decided on penalties.
+            _pens = None
+            if hs == as_:
+                _pens = _extract_pens_fifa(_ev)
+
+            if _pens:
+                p0, p1 = _pens
+                _w = _n0 if p0 > p1 else _n1 if p1 > p0 else "Draw"
+                _pens_out[(_team_key(_n0), _team_key(_n1))] = (p0, p1)
+                _pens_out[(_team_key(_n1), _team_key(_n0))] = (p1, p0)
+            else:
+                _w = _n0 if hs > as_ else _n1 if as_ > hs else "Draw"
+
             _out[(_team_key(_n0), _team_key(_n1))] = _w
             _out[(_team_key(_n1), _team_key(_n0))] = _w
             # Store scores so match cards can display "2 - 1" etc.
@@ -805,9 +884,23 @@ def fetch_api_results():
                     _n0 = _norm_team(_names[0])
                     _n1 = _norm_team(_names[1])
                     _k0, _k1 = _team_key(_n0), _team_key(_n1)
+
+                    # If scores are level, check for a penalty-shootout score from ESPN.
+                    _pens = None
+                    if _sc[0] == _sc[1]:
+                        _pens = _extract_pens_espn(_teams)
+                        if _pens:
+                            p0, p1 = _pens
+                            _pens_out.setdefault((_k0, _k1), (p0, p1))
+                            _pens_out.setdefault((_k1, _k0), (p1, p0))
+
                     # Fill result + score gaps (don't overwrite FIFA data)
                     if (_k0, _k1) not in _out:
-                        _w = _n0 if _sc[0] > _sc[1] else _n1 if _sc[1] > _sc[0] else "Draw"
+                        if _pens:
+                            p0, p1 = _pens
+                            _w = _n0 if p0 > p1 else _n1 if p1 > p0 else "Draw"
+                        else:
+                            _w = _n0 if _sc[0] > _sc[1] else _n1 if _sc[1] > _sc[0] else "Draw"
                         _out[(_k0, _k1)] = _w
                         _out[(_k1, _k0)] = _w
                     # Always fill score gaps from ESPN
@@ -895,7 +988,7 @@ def fetch_api_results():
     except:
         pass
 
-    return _out, _scores_out, _datetimes_out
+    return _out, _scores_out, _datetimes_out, _pens_out
 
 
 @st.cache_data(ttl=3600)   # schedule rarely changes — cache 1 hour
@@ -1211,11 +1304,13 @@ def fetch_live_scores():
     return _out
 
 
-def sync_results_to_excel(file_path, api_results, api_scores=None, live_scores=None, sheet_name="Sheet1"):
+def sync_results_to_excel(file_path, api_results, api_scores=None, live_scores=None, api_pens=None, sheet_name="Sheet1"):
     """
     Write API results (and scores) back into the Excel Result / Score columns.
     Only fills blank cells so manual values stay intact.
     Skips any match that is currently live or in the live window.
+    Also backfills a blank Pens column from auto-detected API penalty scores
+    (never overwrites a Pens value the user has already typed in manually).
     """
     wb = load_workbook(file_path)
     ws = wb[sheet_name]
@@ -1238,6 +1333,12 @@ def sync_results_to_excel(file_path, api_results, api_scores=None, live_scores=N
         c_score = ws.max_column + 1
         ws.cell(1, c_score).value = "Score"
 
+    # Create Pens column if it doesn't exist yet (manual override: "4-3")
+    c_pens = headers.get("Pens")
+    if not c_pens:
+        c_pens = ws.max_column + 1
+        ws.cell(1, c_pens).value = "Pens"
+
     if not c_team1 or not c_team2 or not c_result:
         raise ValueError("Missing required columns: Team 1, Team 2, Result")
 
@@ -1252,20 +1353,25 @@ def sync_results_to_excel(file_path, api_results, api_scores=None, live_scores=N
         if team1 is None or team2 is None:
             continue
 
+        k1 = _team_key(team1)
+        k2 = _team_key(team2)
+
         # Keep manual result if already present.
         if current_result is not None and str(current_result).strip() != "":
-            # But still try to backfill a missing score for already-finished matches
+            # But still try to backfill a missing score / pens for already-finished matches
             current_score = ws.cell(r, c_score).value
             if (current_score is None or str(current_score).strip() == "") and api_scores:
-                k1, k2 = _team_key(team1), _team_key(team2)
                 sc = api_scores.get((k1, k2)) or api_scores.get((k2, k1))
                 if sc:
                     ws.cell(r, c_score).value = f"{sc[0]}-{sc[1]}"
                     updated += 1
+            current_pens = ws.cell(r, c_pens).value
+            if (current_pens is None or str(current_pens).strip() == "") and api_pens:
+                pn = api_pens.get((k1, k2)) or api_pens.get((k2, k1))
+                if pn:
+                    ws.cell(r, c_pens).value = f"{pn[0]}-{pn[1]}"
+                    updated += 1
             continue
-
-        k1 = _team_key(team1)
-        k2 = _team_key(team2)
 
         # Skip matches that are currently live.
         if live_scores and (live_scores.get((k1, k2)) or live_scores.get((k2, k1))):
@@ -1298,6 +1404,11 @@ def sync_results_to_excel(file_path, api_results, api_scores=None, live_scores=N
                 sc = api_scores.get((k1, k2)) or api_scores.get((k2, k1))
                 if sc:
                     ws.cell(r, c_score).value = f"{sc[0]}-{sc[1]}"
+            # Persist auto-detected penalty score too, if any
+            if api_pens:
+                pn = api_pens.get((k1, k2)) or api_pens.get((k2, k1))
+                if pn:
+                    ws.cell(r, c_pens).value = f"{pn[0]}-{pn[1]}"
             updated += 1
 
     if updated:
@@ -1346,11 +1457,11 @@ try:
 except Exception:
     _mtime = 0
 
-_api_results, _api_scores, _api_datetimes = fetch_api_results()
+_api_results, _api_scores, _api_datetimes, _api_pens = fetch_api_results()
 _live_scores  = fetch_live_scores()
 _api_schedule = fetch_schedule()   # authoritative kick-off times for ALL matches
 try:
-    _ = sync_results_to_excel(FILE_PATH, _api_results, api_scores=_api_scores, live_scores=_live_scores)
+    _ = sync_results_to_excel(FILE_PATH, _api_results, api_scores=_api_scores, live_scores=_live_scores, api_pens=_api_pens)
 except Exception as e:
     st.warning(f"Could not sync API results back to Excel: {e}")
 
@@ -1360,6 +1471,22 @@ except Exception:
     _mtime = 0
 
 df = load_data(_mtime, _path=FILE_PATH)
+
+# ── Build the authoritative Pens map ────────────────────────────────────────
+# A manual value typed into the spreadsheet's "Pens" column (e.g. "4-3") always
+# wins over an auto-detected API value, since shootout fields aren't reliably
+# exposed by every provider.
+_pens_map = dict(_api_pens)  # start with best-effort auto-detected values
+if "Pens" in df.columns:
+    for _, _prow in df.iterrows():
+        _pt1, _pt2 = _prow.get("Team 1"), _prow.get("Team 2")
+        if pd.isna(_pt1) or pd.isna(_pt2):
+            continue
+        _pp = _parse_pens(_prow.get("Pens"))
+        if _pp:
+            _pk1, _pk2 = _team_key(_pt1), _team_key(_pt2)
+            _pens_map[(_pk1, _pk2)] = _pp
+            _pens_map[(_pk2, _pk1)] = (_pp[1], _pp[0])
 
 # Create an in-memory copy of the spreadsheet and fill missing Result/Score cells
 # from API results so the UI updates immediately without requiring Excel writes.
@@ -1388,16 +1515,36 @@ try:
             _df_copy.at[idx, "DateTime"]    = _sched_dt
             _df_copy.at[idx, "Date (NZDT)"] = pd.Timestamp(_sched_dt.date())
 
-        # ── Only patch result/score for blank rows that have already kicked off ──
+        # ── If a manual/auto Pens value exists for a drawn match, the pens
+        #    winner takes precedence over a "Draw" Result, in/out of Excel. ──
+        _pen_pair = _pens_map.get((k1, k2)) or _pens_map.get((k2, k1))
         cur = _row.get("Result")
+        cur_is_blank = pd.isna(cur) or str(cur).strip() == ""
+        cur_is_draw  = (not cur_is_blank) and _is_draw_result(cur)
+
+        if _pen_pair and (cur_is_blank or cur_is_draw):
+            p0, p1 = _pens_map.get((k1, k2), (None, None))
+            if p0 is None:
+                # only the reverse-keyed pair was found
+                p1, p0 = _pens_map.get((k2, k1))
+            if p0 is not None and p1 is not None:
+                _winner = t1 if p0 > p1 else t2 if p1 > p0 else None
+                if _winner:
+                    _df_copy.at[idx, "Result"] = _winner
+                    cur_is_blank = False  # treat as resolved below
+
+        # ── Only patch result/score for blank rows that have already kicked off ──
+        cur = _df_copy.at[idx, "Result"]
         if pd.notna(cur) and str(cur).strip() != "":
-            continue
-        _match_dt = _df_copy.at[idx, "DateTime"]   # use the potentially-updated value
-        if _match_dt is not None and pd.notna(_match_dt) and _match_dt > _now_patch:
-            continue
-        winner = _api_results.get((k1, k2)) or _api_results.get((k2, k1))
-        if winner:
-            _df_copy.at[idx, "Result"] = winner
+            pass
+        else:
+            _match_dt = _df_copy.at[idx, "DateTime"]   # use the potentially-updated value
+            if _match_dt is not None and pd.notna(_match_dt) and _match_dt > _now_patch:
+                pass
+            else:
+                winner = _api_results.get((k1, k2)) or _api_results.get((k2, k1))
+                if winner:
+                    _df_copy.at[idx, "Result"] = winner
         cur_score = _row.get("Score")
         if (pd.isna(cur_score) if isinstance(cur_score, float) else not cur_score):
             sc = _api_scores.get((k1, k2)) if '_api_scores' in globals() else None
@@ -1687,6 +1834,11 @@ else:
         live = (_live_scores.get((k1, k2)) or _live_scores.get((k2, k1))) if '_live_scores' in globals() else None
         api_result = _api_results.get((k1, k2)) or _api_results.get((k2, k1))
         api_score  = (_api_scores.get((k1, k2)) or _api_scores.get((k2, k1))) if '_api_scores' in globals() else None
+        pen_pair   = (_pens_map.get((k1, k2)) if '_pens_map' in globals() else None)
+        if pen_pair is None and '_pens_map' in globals():
+            _rev = _pens_map.get((k2, k1))
+            if _rev:
+                pen_pair = (_rev[1], _rev[0])
 
         # Override dt from API schedule (covers upcoming + finished) — Excel dates never used
         _sched_dt = (
@@ -1742,10 +1894,12 @@ else:
             # Live data is available – clear any stale Excel / API result.
             has_result = False
             result = None
-        elif _in_live_window and has_result and _is_draw_result(result):
+        elif _in_live_window and has_result and _is_draw_result(result) and not pen_pair:
             # A "Draw" within the live window is likely a pre-match / in-progress
             # 0-0 placeholder written to Excel by a previous run.  Treat as pending.
             # BUT if the API explicitly confirms it as finished, trust the API.
+            # (If a penalty shootout result/score is already known, skip this —
+            # the match is genuinely over.)
             api_confirmed = bool(api_result)
             if not api_confirmed:
                 has_result = False
@@ -1755,7 +1909,8 @@ else:
             result = str(api_result).strip()
             has_result = True
 
-        # If a live feed has clearly finished and it's a draw, show Draw.
+        # If a live feed has clearly finished and it's a draw, show Draw
+        # (unless a penalty shootout score resolves it — handled below).
         finalized_live_draw = bool(
             is_finished_feed
             and live
@@ -1766,6 +1921,25 @@ else:
         if finalized_live_draw and not has_result:
             result = "Draw"
             has_result = True
+
+        # ── Penalty shootout resolves a level scoreline ─────────────────────
+        # If the match is finished, the scoreline is level, and we have a
+        # penalty-shootout score (manual "Pens" column or auto-detected),
+        # the shootout winner overrides a "Draw" result.
+        pens_decided = False
+        if (has_result or finalized_live_draw) and pen_pair:
+            _score_for_pens = api_score or (
+                (live.get("home"), live.get("away")) if (live and live.get("home") is not None) else None
+            )
+            _level = (result and _is_draw_result(result)) or (
+                _score_for_pens is not None and _score_for_pens[0] == _score_for_pens[1]
+            )
+            if _level:
+                p0, p1 = pen_pair
+                if p0 != p1:
+                    result = team1 if p0 > p1 else team2
+                    has_result = True
+                    pens_decided = True
 
         f1 = flag_html(get_flag_url(team1))
         f2 = flag_html(get_flag_url(team2))
@@ -1791,7 +1965,25 @@ else:
             _fin_score = api_score or (
                 (live.get("home"), live.get("away")) if live else None
             )
-            if result and _is_draw_result(result):
+            if pens_decided:
+                p0, p1 = pen_pair
+                _winner_name = team1 if p0 > p1 else team2
+                _wp, _lp = (p0, p1) if p0 > p1 else (p1, p0)
+                if _fin_score and _fin_score[0] is not None:
+                    if _team_key(_winner_name) == _team_key(team1):
+                        t1_cls, t2_cls = "winner", "loser"
+                    else:
+                        t1_cls, t2_cls = "loser", "winner"
+                    score_html = (
+                        f'<span class="result-win score-line">'
+                        f'{_fin_score[0]} — {_fin_score[1]}'
+                        f'<br><span style="font-size:12px;letter-spacing:1px;color:#ffd700;font-family:\'Bebas Neue\',Impact,sans-serif;">'
+                        f'{_winner_name} WON {_wp}-{_lp} ON PENS</span>'
+                        f'</span>'
+                    )
+                else:
+                    score_html = f'<span class="result-win">{_winner_name}<br>WON {_wp}-{_lp} ON PENS</span>'
+            elif result and _is_draw_result(result):
                 if _fin_score and _fin_score[0] is not None:
                     score_html = (
                         f'<span class="result-draw">'
